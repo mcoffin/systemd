@@ -2197,6 +2197,7 @@ int home_create_luks(
         const char *fstype, *ip;
         struct statfs sfs;
         struct stat st;
+        bool create_partition_table = true;
         int r;
         _cleanup_strv_free_ char **extra_mkfs_options = NULL;
 
@@ -2234,12 +2235,7 @@ int home_create_luks(
                 fstype = "ext4";
         }
 
-        if (sd_id128_is_null(h->partition_uuid)) {
-                r = sd_id128_randomize(&partition_uuid);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to acquire partition UUID: %m");
-        } else
-                partition_uuid = h->partition_uuid;
+        partition_uuid = h->partition_uuid;
 
         if (sd_id128_is_null(h->luks_uuid)) {
                 r = sd_id128_randomize(&luks_uuid);
@@ -2267,7 +2263,7 @@ int home_create_luks(
                 return log_error_errno(SYNTHETIC_ERRNO(EEXIST), "Device mapper device %s already exists, refusing.", setup->dm_node);
 
         if (path_startswith(ip, "/dev/")) {
-                _cleanup_free_ char *sysfs = NULL;
+                dev_t parent;
                 uint64_t block_device_size;
 
                 /* Let's place the home directory on a real device, i.e. a USB stick or such */
@@ -2279,14 +2275,6 @@ int home_create_luks(
                 if (!S_ISBLK(st.st_mode))
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTBLK), "Device is not a block device, refusing.");
 
-                if (asprintf(&sysfs, "/sys/dev/block/" DEVNUM_FORMAT_STR "/partition", DEVNUM_FORMAT_VAL(st.st_rdev)) < 0)
-                        return log_oom();
-                if (access(sysfs, F_OK) < 0) {
-                        if (errno != ENOENT)
-                                return log_error_errno(errno, "Failed to check whether %s exists: %m", sysfs);
-                } else
-                        return log_error_errno(SYNTHETIC_ERRNO(ENOTBLK), "Operating on partitions is currently not supported, sorry. Please specify a top-level block device.");
-
                 if (flock(setup->image_fd, LOCK_EX) < 0) /* make sure udev doesn't read from it while we operate on the device */
                         return log_error_errno(errno, "Failed to lock block device %s: %m", ip);
 
@@ -2294,27 +2282,52 @@ int home_create_luks(
                 if (r < 0)
                         return log_error_errno(r, "Failed to read block device size: %m");
 
+                r = block_get_whole_disk(st.st_rdev, &parent);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to determine whether %s is a whole block device or partition: %m", ip);
+                if (r > 0) {
+                        create_partition_table = false;
+
+                        if (!sd_id128_is_null(partition_uuid))
+                                log_info("Operating on partition device %s directly, ignoring configured partition UUID.", ip);
+                        else
+                                log_info("Operating on partition device %s directly.", ip);
+
+                        partition_uuid = SD_ID128_NULL;
+                } else if (sd_id128_is_null(partition_uuid)) {
+                        r = sd_id128_randomize(&partition_uuid);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to acquire partition UUID: %m");
+                }
+
                 if (h->disk_size == UINT64_MAX) {
 
                         /* If a relative disk size is requested, apply it relative to the block device size */
-                        if (h->disk_size_relative < UINT32_MAX)
+                        if (h->disk_size_relative < UINT32_MAX) {
+                                if (!create_partition_table)
+                                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Sizing partition-backed LUKS homes relative to the partition is currently not supported, please specify the full partition.");
+
                                 host_size = CLAMP(DISK_SIZE_ROUND_DOWN(block_device_size * h->disk_size_relative / UINT32_MAX),
                                                   USER_DISK_SIZE_MIN, USER_DISK_SIZE_MAX);
-                        else
+                        } else
                                 host_size = block_device_size; /* Otherwise, take the full device */
 
                 } else if (h->disk_size > block_device_size)
                         return log_error_errno(SYNTHETIC_ERRNO(EMSGSIZE), "Selected disk size larger than backing block device, refusing.");
-                else
-                        host_size = DISK_SIZE_ROUND_DOWN(h->disk_size);
+                else {
+                        if (!create_partition_table && DISK_SIZE_ROUND_DOWN(h->disk_size) != DISK_SIZE_ROUND_DOWN(block_device_size))
+                                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Partition-backed LUKS homes currently have to use the full partition size.");
+
+                        host_size = create_partition_table ? DISK_SIZE_ROUND_DOWN(h->disk_size) : block_device_size;
+                }
 
                 if (!supported_fs_size(fstype, LESS_BY(host_size, GPT_LUKS2_OVERHEAD)))
                         return log_error_errno(SYNTHETIC_ERRNO(ERANGE),
                                                "Selected file system size too small for %s.", fstype);
 
-                /* After creation we should reference this partition by its UUID instead of the block
-                 * device. That's preferable since the user might have specified a device node such as
-                 * /dev/sdb to us, which might look very different when replugged. */
+                /* After creation we should reference the LUKS block device by UUID instead of the original
+                 * device node. That's preferable since the user might have specified a device node such as
+                 * /dev/sdb1 to us, which might look very different when replugged. */
                 if (asprintf(&disk_uuid_path, "/dev/disk/by-uuid/" SD_ID128_UUID_FORMAT_STR, SD_ID128_FORMAT_VAL(luks_uuid)) < 0)
                         return log_oom();
 
@@ -2329,6 +2342,12 @@ int home_create_luks(
                 }
         } else {
                 _cleanup_free_ char *t = NULL;
+
+                if (sd_id128_is_null(partition_uuid)) {
+                        r = sd_id128_randomize(&partition_uuid);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to acquire partition UUID: %m");
+                }
 
                 r = mkdir_parents(ip, 0755);
                 if (r < 0)
@@ -2374,18 +2393,23 @@ int home_create_luks(
                 } else
                         image_sector_size = luks_sector_size = user_record_luks_sector_size(h);
         }
-        r = make_partition_table(
-                        setup->image_fd,
-                        image_sector_size,
-                        user_record_user_name_and_realm(h),
-                        partition_uuid,
-                        &partition_offset,
-                        &partition_size,
-                        &disk_uuid);
-        if (r < 0)
-                return r;
+        if (create_partition_table) {
+                r = make_partition_table(
+                                setup->image_fd,
+                                image_sector_size,
+                                user_record_user_name_and_realm(h),
+                                partition_uuid,
+                                &partition_offset,
+                                &partition_size,
+                                &disk_uuid);
+                if (r < 0)
+                        return r;
 
-        log_info("Writing of partition table completed.");
+                log_info("Writing of partition table completed.");
+        } else {
+                partition_offset = 0;
+                partition_size = UINT64_MAX;
+        }
 
         if (fstat(setup->image_fd, &st) < 0)
                 return log_error_errno(errno, "Failed to fstat home image: %m");
@@ -2393,25 +2417,36 @@ int home_create_luks(
         /* Ensure we don't create a loop device over block device as it leads to huge overhead for discard operations
          * if the device does not support discard_zeroes_data */
         if (S_ISBLK(st.st_mode)) {
-                _cleanup_free_ char *partition_path = NULL;
-                assert(!sd_id128_is_null(partition_uuid));
-                if (asprintf(&partition_path, "/dev/disk/by-partuuid/" SD_ID128_UUID_FORMAT_STR, SD_ID128_FORMAT_VAL(partition_uuid)) < 0)
-                        return log_oom();
+                if (create_partition_table) {
+                        _cleanup_free_ char *partition_path = NULL;
 
-                /* Release the lock, so that udev can find the partition */
-                setup->image_fd = safe_close(setup->image_fd);
-                (void) wait_for_devlink(partition_path);
-                setup->image_fd = open_image_file(h, ip, &st);
-                if (setup->image_fd < 0)
-                        return setup->image_fd;
+                        assert(!sd_id128_is_null(partition_uuid));
+                        if (asprintf(&partition_path, "/dev/disk/by-partuuid/" SD_ID128_UUID_FORMAT_STR, SD_ID128_FORMAT_VAL(partition_uuid)) < 0)
+                                return log_oom();
 
-                r = loop_device_open_from_path(
-                                partition_path,
-                                O_RDWR,
-                                LOCK_EX,
-                                &setup->loop);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to open newly written partition device: %s", partition_path);
+                        /* Release the lock, so that udev can find the partition */
+                        setup->image_fd = safe_close(setup->image_fd);
+                        (void) wait_for_devlink(partition_path);
+                        setup->image_fd = open_image_file(h, ip, &st);
+                        if (setup->image_fd < 0)
+                                return setup->image_fd;
+
+                        r = loop_device_open_from_path(
+                                        partition_path,
+                                        O_RDWR,
+                                        LOCK_EX,
+                                        &setup->loop);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to open newly written partition device: %s", partition_path);
+                } else {
+                        r = loop_device_open_from_path(
+                                        ip,
+                                        O_RDWR,
+                                        LOCK_EX,
+                                        &setup->loop);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to open block device %s: %m", ip);
+                }
         } else {
                 r = loop_device_make(
                                 setup->image_fd,
@@ -2561,23 +2596,25 @@ int home_create_luks(
         if (fsync(setup->image_fd) < 0)
                 return log_error_errno(r, "Failed to synchronize image to disk: %m");
 
-        if (disk_uuid_path)
+        if (disk_uuid_path && create_partition_table)
                 /* Reread partition table if this is a block device */
                 (void) reread_partition_table_fd(setup->image_fd, /* flags= */ 0);
         else {
-                assert(setup->temporary_image_path);
+                if (!disk_uuid_path) {
+                        assert(setup->temporary_image_path);
 
-                if (rename(setup->temporary_image_path, ip) < 0)
-                        return log_error_errno(errno, "Failed to rename image file: %m");
+                        if (rename(setup->temporary_image_path, ip) < 0)
+                                return log_error_errno(errno, "Failed to rename image file: %m");
 
-                setup->temporary_image_path = mfree(setup->temporary_image_path);
+                        setup->temporary_image_path = mfree(setup->temporary_image_path);
 
-                /* If we operate on a file, sync the containing directory too. */
-                r = fsync_directory_of_file(setup->image_fd);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to synchronize directory of image file to disk: %m");
+                        /* If we operate on a file, sync the containing directory too. */
+                        r = fsync_directory_of_file(setup->image_fd);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to synchronize directory of image file to disk: %m");
 
-                log_info("Moved image file into place.");
+                        log_info("Moved image file into place.");
+                }
         }
 
         /* Let's close the image fd now. If we are operating on a real block device this will release the BSD
@@ -2591,7 +2628,10 @@ int home_create_luks(
 
         print_size_summary(host_size, encrypted_size, &sfs);
 
-        log_debug("GPT + LUKS2 overhead is %" PRIu64 " (expected %" PRIu64 ")", host_size - encrypted_size, GPT_LUKS2_OVERHEAD);
+        if (create_partition_table)
+                log_debug("GPT + LUKS2 overhead is %" PRIu64 " (expected %" PRIu64 ")", host_size - encrypted_size, GPT_LUKS2_OVERHEAD);
+        else
+                log_debug("LUKS2 overhead is %" PRIu64 ".", host_size - encrypted_size);
 
         *ret_home = TAKE_PTR(new_home);
         return 0;
