@@ -952,4 +952,61 @@ testcase_match() {
     homectl remove matchtest
 }
 
+testcase_partition_luks() {
+    local LOOPDEV PARTDEV
+
+    . /etc/os-release
+    if [[ "${ID_LIKE:-}" == alpine ]] && ! systemd-detect-virt -cq; then
+        # luks seems to be broken on alpine/postmarketos.
+        return 0
+    fi
+
+    if systemd-detect-virt --quiet --container; then
+        # Loop devices with partition scanning don't work reliably in containers.
+        return 0
+    fi
+
+    # Clean up from any aborted previous run.
+    [[ -n "${LOOPDEV:-}" ]] && losetup -d "$LOOPDEV" 2>/dev/null || true
+    rm -f /tmp/partition-test.img 2>/dev/null || true
+    homectl remove partition-test-user 2>/dev/null || true
+
+    # Create a 300MB image and set up a single GPT partition on it.
+    dd if=/dev/zero of=/tmp/partition-test.img bs=1M count=300
+    sfdisk /tmp/partition-test.img <<EOF
+label: gpt
+size=280M
+type=773f91ef-66d4-49b5-bd83-d683bf40ad16
+EOF
+
+    LOOPDEV="$(losetup --show --find --partscan /tmp/partition-test.img)"
+    PARTDEV="${LOOPDEV}p1"
+
+    # Wait for udev to create the partition device node.
+    udevadm settle --timeout=30
+
+    # Create a LUKS home directly on the partition (not on the whole disk).
+    NEWPASSWORD=xEhErW0ndafV4s \
+        homectl create partition-test-user \
+        --luks-discard=yes \
+        --image-path="$PARTDEV" \
+        --luks-pbkdf-type=pbkdf2 \
+        --luks-pbkdf-time-cost=1ms \
+        --rate-limit-interval=1s \
+        --rate-limit-burst=1000
+    inspect partition-test-user
+
+    PASSWORD=xEhErW0ndafV4s homectl activate partition-test-user
+    inspect partition-test-user
+
+    homectl deactivate partition-test-user
+    inspect partition-test-user
+
+    wait_for_state partition-test-user inactive
+    homectl remove partition-test-user
+
+    losetup -d "$LOOPDEV"
+    rm -f /tmp/partition-test.img
+}
+
 run_testcases
